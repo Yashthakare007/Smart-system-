@@ -1,0 +1,7 @@
+flask
+flask-cors
+opencv-python-headless
+numpy
+ultralytics
+requests
+# ultralytics will pull a torch build; choose CPU/GPU wheel appropriate for your system if needed
