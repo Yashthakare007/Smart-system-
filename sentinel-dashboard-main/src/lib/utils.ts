@@ -85,3 +85,53 @@ export function getSuspiciousStreamUrl(params: { source: "webcam" | "video"; vid
   if (!params.videoPath) return null;
   return `${BACKEND_URL}/stream/suspicious?source=video&video_path=${encodeURIComponent(params.videoPath)}`;
 }
+
+// ✅ Upload missing person reference data
+export async function uploadMissingPerson(
+  personImageFile: File,
+  metadata?: { name?: string; age?: string }
+) {
+  const formData = new FormData();
+  formData.append("person_image", personImageFile);
+  if (metadata?.name) formData.append("name", metadata.name);
+  if (metadata?.age) formData.append("age", metadata.age);
+
+  const response = await fetch(`${BACKEND_URL}/api/missing/upload-person`, {
+    method: "POST",
+    body: formData,
+  });
+
+  return asJson(response);
+}
+
+// ✅ Start missing person detection
+export async function startMissingPersonDetection(
+  videoPath: string,
+  personId: string,
+  source: "webcam" | "video"
+) {
+  const response = await fetch(`${BACKEND_URL}/api/missing/detect`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      video_path: videoPath,
+      person_id: personId,
+      source: source,
+    }),
+  });
+
+  return asJson(response);
+}
+
+// ✅ Get missing person stream URL for preview
+export function getMissingStreamUrl(params: {
+  source: "webcam" | "video";
+  videoPath?: string | null;
+}) {
+  if (params.source === "webcam")
+    return `${BACKEND_URL}/stream/missing?source=webcam`;
+  if (!params.videoPath) return null;
+  return `${BACKEND_URL}/stream/missing?source=video&video_path=${encodeURIComponent(
+    params.videoPath
+  )}`;
+}

@@ -5,7 +5,8 @@ import {
   AlertTriangle, 
   FileText,
   Shield,
-  Camera
+  Camera,
+  UserSearch
 } from "lucide-react";
 
 interface SidebarProps {
@@ -19,6 +20,7 @@ const navItems = [
   { id: "video-input", label: "Video Input", icon: Video },
   { id: "mob-detection", label: "Mob Detection", icon: Users },
   { id: "suspicious-activity", label: "Suspicious Activity", icon: AlertTriangle },
+  { id: "missing-person", label: "Missing Person", icon: UserSearch },
   { id: "alerts-logs", label: "Alerts & Logs", icon: FileText },
 ];
 

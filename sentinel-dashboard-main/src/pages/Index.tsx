@@ -7,6 +7,7 @@ import { VideoInputPanel } from "@/components/panels/VideoInputPanel";
 import { MobDetectionPanel } from "@/components/panels/MobDetectionPanel";
 import { SuspiciousActivityPanel } from "@/components/panels/SuspiciousActivityPanel";
 import { AlertsLogsPanel } from "@/components/panels/AlertsLogsPanel";
+import { MissingPersonPanel } from "@/components/panels/MissingPersonPanel";
 
 const Index = () => {
   const [activePanel, setActivePanel] = useState("dashboard");
@@ -25,6 +26,8 @@ const Index = () => {
         return <SuspiciousActivityPanel />;
       case "alerts-logs":
         return <AlertsLogsPanel />;
+      case "missing-person":
+        return <MissingPersonPanel />;
       default:
         return <DashboardPanel />;
     }
