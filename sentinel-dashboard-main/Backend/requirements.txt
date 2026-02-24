@@ -1,7 +1,9 @@
 flask
 flask-cors
-opencv-python-headless
+opencv-python
+opencv-contrib-python
 numpy
 ultralytics
 requests
 # ultralytics will pull a torch build; choose CPU/GPU wheel appropriate for your system if needed
+# opencv-contrib-python needed for cv2.face (LBPHFaceRecognizer)

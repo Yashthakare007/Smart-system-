@@ -43,6 +43,41 @@ export async function startMobDetection(videoPath: string) {
   return asJson(response);
 }
 
+// ✅ Start suspicious detection (controls stream detection on/off)
+export async function startSuspicious(source: "webcam" | "video", videoPath?: string | null) {
+  const body: any = { source };
+  if (source === "video" && videoPath) {
+    body.video_path = videoPath;
+  }
+
+  const response = await fetch(`${BACKEND_URL}/suspicious/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  return asJson(response);
+}
+
+// ✅ Stop suspicious detection
+export async function stopSuspicious() {
+  const response = await fetch(`${BACKEND_URL}/suspicious/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+
+  return asJson(response);
+}
+
+// ✅ Reset suspicious events
+export async function resetSuspicious() {
+  const response = await fetch(`${BACKEND_URL}/suspicious/reset`, {
+    method: "POST",
+  });
+
+  return asJson(response);
+}
+
 // ✅ Start suspicious detection (backend already has this)
 export async function startSuspiciousDetection(videoPath: string) {
   const response = await fetch(`${BACKEND_URL}/api/suspicious-detect`, {
@@ -86,17 +121,28 @@ export function getSuspiciousStreamUrl(params: { source: "webcam" | "video"; vid
   return `${BACKEND_URL}/stream/suspicious?source=video&video_path=${encodeURIComponent(params.videoPath)}`;
 }
 
-// ✅ Upload missing person reference data
-export async function uploadMissingPerson(
-  personImageFile: File,
-  metadata?: { name?: string; age?: string }
+// ========================================
+// ✅ MISSING PERSON HELPERS
+// ========================================
+
+/**
+ * Register a missing person with name, age, and multiple face images.
+ * Returns { message, person_name, images_saved }
+ */
+export async function registerMissingPerson(
+  name: string,
+  age: string,
+  imageFiles: File[]
 ) {
   const formData = new FormData();
-  formData.append("person_image", personImageFile);
-  if (metadata?.name) formData.append("name", metadata.name);
-  if (metadata?.age) formData.append("age", metadata.age);
+  formData.append("name", name);
+  formData.append("age", age);
+  
+  imageFiles.forEach((file) => {
+    formData.append("images", file);
+  });
 
-  const response = await fetch(`${BACKEND_URL}/api/missing/upload-person`, {
+  const response = await fetch(`${BACKEND_URL}/api/missing/register`, {
     method: "POST",
     body: formData,
   });
@@ -104,34 +150,104 @@ export async function uploadMissingPerson(
   return asJson(response);
 }
 
-// ✅ Start missing person detection
-export async function startMissingPersonDetection(
-  videoPath: string,
-  personId: string,
-  source: "webcam" | "video"
-) {
-  const response = await fetch(`${BACKEND_URL}/api/missing/detect`, {
+/**
+ * Train the LBPH face recognizer model on all registered persons.
+ * Returns { message, persons_count, images_used }
+ */
+export async function trainMissingModel() {
+  const response = await fetch(`${BACKEND_URL}/api/missing/train`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      video_path: videoPath,
-      person_id: personId,
-      source: source,
-    }),
   });
 
   return asJson(response);
 }
 
-// ✅ Get missing person stream URL for preview
-export function getMissingStreamUrl(params: {
-  source: "webcam" | "video";
-  videoPath?: string | null;
-}) {
-  if (params.source === "webcam")
-    return `${BACKEND_URL}/stream/missing?source=webcam`;
-  if (!params.videoPath) return null;
-  return `${BACKEND_URL}/stream/missing?source=video&video_path=${encodeURIComponent(
-    params.videoPath
-  )}`;
+/**
+ * Detect a missing person in a given image frame.
+ * imageBlob: JPEG/PNG blob
+ * Returns { found: boolean, name?: string, age?: string, confidence: number, bbox?: [x,y,w,h] }
+ */
+export async function detectMissingImage(imageBlob: Blob) {
+  const formData = new FormData();
+  formData.append("image", imageBlob, "frame.jpg");
+
+  const response = await fetch(`${BACKEND_URL}/api/missing/detect-image`, {
+    method: "POST",
+    body: formData,
+  });
+
+  return asJson(response);
 }
+
+/**
+ * Start continuous missing person detection on webcam or video.
+ * Returns { running: true, source, video_path, message }
+ */
+export async function startMissingPersonDetection(source: "webcam" | "video", videoPath?: string | null) {
+  const body: any = { source };
+  if (source === "video" && videoPath) {
+    body.video_path = videoPath;
+  }
+
+  const response = await fetch(`${BACKEND_URL}/api/missing/start-detection`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  return asJson(response);
+}
+
+/**
+ * Stop continuous missing person detection.
+ * Returns { stopped: true, message }
+ */
+export async function stopMissingPersonDetection() {
+  const response = await fetch(`${BACKEND_URL}/api/missing/stop-detection`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+
+  return asJson(response);
+}
+
+/**
+ * Get missing person detection status.
+ * Returns { running: boolean, source: string, video_path: string | null }
+ */
+export async function getMissingPersonDetectionStatus() {
+  const response = await fetch(`${BACKEND_URL}/api/missing/detection-status`);
+  return asJson(response);
+}
+
+/**
+ * Get all missing person detection alerts.
+ * Returns { alerts: [...], total: number }
+ */
+export async function getMissingPersonAlerts() {
+  const response = await fetch(`${BACKEND_URL}/api/missing/alerts`);
+  return asJson(response);
+}
+
+/**
+ * Get latest missing person alert.
+ * Returns { alert: {...} | null }
+ */
+export async function getLatestMissingAlert() {
+  const response = await fetch(`${BACKEND_URL}/api/missing/alerts/latest`);
+  return asJson(response);
+}
+
+/**
+ * Clear all missing person detection alerts.
+ * Returns { message, count }
+ */
+export async function clearMissingPersonAlerts() {
+  const response = await fetch(`${BACKEND_URL}/api/missing/alerts/clear`, {
+    method: "POST",
+  });
+
+  return asJson(response);
+}
+
