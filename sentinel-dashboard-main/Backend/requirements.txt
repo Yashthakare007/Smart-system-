@@ -5,5 +5,8 @@ opencv-contrib-python
 numpy
 ultralytics
 requests
+torch
+transformers
+# torch and transformers needed for VideoMAE model
 # ultralytics will pull a torch build; choose CPU/GPU wheel appropriate for your system if needed
 # opencv-contrib-python needed for cv2.face (LBPHFaceRecognizer)

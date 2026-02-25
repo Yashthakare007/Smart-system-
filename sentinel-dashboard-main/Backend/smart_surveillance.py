@@ -111,7 +111,7 @@ def add_missing_person_alert(name, age, confidence, person_id=None):
     MISSING_PERSON_ALERTS.append(alert)
     if len(MISSING_PERSON_ALERTS) > MAX_ALERTS:
         del MISSING_PERSON_ALERTS[: len(MISSING_PERSON_ALERTS) - MAX_ALERTS]
-    
+
     # Also log as general event
     add_event(
         event_type=f"Missing Person: {name}",
@@ -148,18 +148,17 @@ def load_face_cascade():
     global mp_face_cascade
     if mp_face_cascade is not None:
         return mp_face_cascade
-    
+
     try:
         import cv2
     except ImportError:
         raise ImportError("Missing opencv-python")
-    
+
     cascade_path = os.path.join(mp_paths()["haarcascade"], "haarcascade_frontalface_default.xml")
-    
+
     # If cascade doesn't exist, try to copy from opencv package
     if not os.path.isfile(cascade_path):
         try:
-            # Get cascade from opencv installation
             import cv2.data
             default_cascade = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
             if os.path.isfile(default_cascade):
@@ -167,7 +166,7 @@ def load_face_cascade():
                 shutil.copy(default_cascade, cascade_path)
         except Exception:
             pass
-    
+
     # Load cascade
     if os.path.isfile(cascade_path):
         mp_face_cascade = cv2.CascadeClassifier(cascade_path)
@@ -199,31 +198,31 @@ def save_persons_json(data):
 def load_lbph_model():
     """Load trained LBPH face recognizer model and labels."""
     global mp_lbph_model, mp_label_mapping
-    
+
     if mp_lbph_model is not None and mp_label_mapping is not None:
         return mp_lbph_model, mp_label_mapping
-    
+
     try:
         import cv2
         import numpy as np
     except ImportError:
         raise ImportError("Missing opencv-contrib-python or numpy")
-    
+
     trainer_path = os.path.join(mp_paths()["trainer"], "face_trainer.yml")
     labels_path = os.path.join(mp_paths()["trainer"], "labels.npy")
-    
+
     if not os.path.isfile(trainer_path) or not os.path.isfile(labels_path):
         return None, None
-    
+
     try:
         recognizer = cv2.face.LBPHFaceRecognizer_create()
         recognizer.read(trainer_path)
-        
+
         labels_dict = np.load(labels_path, allow_pickle=True).item()
-        
+
         mp_lbph_model = recognizer
         mp_label_mapping = labels_dict
-        
+
         return recognizer, labels_dict
     except Exception as e:
         print(f"Failed to load LBPH model: {e}")
@@ -306,77 +305,168 @@ def load_videomae_model():
         raise RuntimeError(f"Failed to load VideoMAE model: {e}")
 
 
-def get_videomae_clip(cap, frame_count=16):
+def videomae_label_to_status(label_str):
+    s = (label_str or "").lower().replace("-", "_").replace(" ", "_")
+
+    # HIGH risk keywords - UCF-Crime Dataset activities
+    high_risk = [
+        "abuse", "assault", "arrest", "arson", "burglary", "explosion", "fighting",
+        "robbery", "shooting", "shoplifting", "stealing", "vandalism",
+        "knife", "gun", "weapon", "bomb", "explosive",
+        "fight", "attack", "shoot", "kidnap", "kidnapping", "theft", "snatch", "violence", "crime"
+    ]
+
+    # MID risk keywords
+    mid_risk = ["suspicious", "intrusion", "trespass", "perimeter", "threat", "anomaly", "unusual", "accident", "road"]
+
+    if any(k in s for k in high_risk):
+        return "suspicious"
+    if any(k in s for k in mid_risk):
+        return "warning"
+    return "normal"
+
+
+# ========================================
+# VideoMAE: ROI + Sliding Window + Smoothing (IMPROVED)
+# ========================================
+
+def _union_person_bbox_yolo(frame_bgr, margin=0.12, min_area=0.01):
     """
-    Extract exactly `frame_count` frames from video capture.
-    Convert BGR->RGB and resize to 224x224. Pads with last frame if necessary.
-    Returns list of frames (numpy arrays) or None if capture failed to return any frame.
+    Optional helper: detect persons using YOLO and return a union bbox (x1,y1,x2,y2).
+    Returns None if no person found.
     """
     try:
-        import cv2
         import numpy as np
     except ImportError:
         return None
 
+    try:
+        person_model = load_person_model()
+    except Exception:
+        return None
+
+    h, w = frame_bgr.shape[:2]
+    img_area = float(h * w)
+
+    try:
+        results = person_model(frame_bgr, verbose=False)
+    except Exception:
+        return None
+
+    x1s, y1s, x2s, y2s = [], [], [], []
+    for r in results:
+        for box in getattr(r, "boxes", []):
+            try:
+                cls_id = int(box.cls[0])
+            except Exception:
+                continue
+            if cls_id != 0:  # person
+                continue
+
+            try:
+                x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
+            except Exception:
+                continue
+
+            # filter tiny boxes
+            area = max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
+            if area < img_area * min_area:
+                continue
+
+            x1s.append(x1); y1s.append(y1); x2s.append(x2); y2s.append(y2)
+
+    if not x1s:
+        return None
+
+    x1 = max(0, int(min(x1s)))
+    y1 = max(0, int(min(y1s)))
+    x2 = min(w - 1, int(max(x2s)))
+    y2 = min(h - 1, int(max(y2s)))
+
+    # add margin
+    bw = x2 - x1
+    bh = y2 - y1
+    mx = int(bw * margin)
+    my = int(bh * margin)
+
+    x1 = max(0, x1 - mx)
+    y1 = max(0, y1 - my)
+    x2 = min(w - 1, x2 + mx)
+    y2 = min(h - 1, y2 + my)
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _crop_and_resize_rgb(frame_bgr, bbox=None, out_size=(224, 224)):
+    """
+    Convert BGR->RGB and resize to 224x224.
+    If bbox provided, crop first.
+    """
+    import cv2
+
+    if bbox is not None:
+        x1, y1, x2, y2 = bbox
+        frame_bgr = frame_bgr[y1:y2, x1:x2]
+        if frame_bgr is None or frame_bgr.size == 0:
+            return None
+
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.resize(rgb, out_size)
+    return rgb
+
+
+def get_videomae_clip(cap, frame_count=16, stride=2, roi_bbox=None):
+    """
+    Read a clip using stride (sliding window):
+      - reads frame_count frames
+      - between frames, skips (stride-1) frames
+    If read fails, pads with last frame.
+    Returns list of RGB resized frames (224x224) or None.
+    """
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        return None
+
     frames = []
-    last_frame = None
+    last_good = None
 
     for _ in range(frame_count):
         ret, frame = cap.read()
         if not ret:
-            # Pad with last_frame if available
-            if last_frame is not None:
-                frames.append(last_frame)
-            else:
-                # Try a short wait and one more read for webcams
-                time.sleep(0.05)
-                ret2, frame2 = cap.read()
-                if ret2:
-                    frame_rgb = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
-                    frame_resized = cv2.resize(frame_rgb, (224, 224))
-                    frames.append(frame_resized)
-                    last_frame = frame_resized
-                else:
-                    # No frames at all
-                    return None
+            if last_good is None:
+                return None
+            frames.append(last_good)
         else:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_resized = cv2.resize(frame_rgb, (224, 224))
-            frames.append(frame_resized)
-            last_frame = frame_resized
+            fr = _crop_and_resize_rgb(frame, bbox=roi_bbox)
+            if fr is None:
+                if last_good is None:
+                    return None
+                frames.append(last_good)
+            else:
+                frames.append(fr)
+                last_good = fr
 
-    # Ensure exact length
-    if len(frames) < frame_count:
-        # pad with last frame
-        while len(frames) < frame_count and last_frame is not None:
-            frames.append(last_frame)
+        # skip frames for stride
+        for _skip in range(max(0, stride - 1)):
+            cap.read()
 
-    return frames
+    if len(frames) < frame_count and last_good is not None:
+        while len(frames) < frame_count:
+            frames.append(last_good)
 
-
-def videomae_label_to_status(label_str):
-    s = (label_str or "").lower().replace("-", "_").replace(" ", "_")
-    HIGH_RISK_KEYWORDS = [
-        "knife", "gun", "weapon", "bomb", "explosive",
-        "assault", "fight", "fighting", "attack", "shoot", "shooting",
-        "kidnap", "kidnapping", "robbery", "theft", "snatch"
-    ]
-    MID_RISK_KEYWORDS = ["suspicious", "intrusion", "trespass", "perimeter", "threat", "anomaly"]
-    if any(k in s for k in HIGH_RISK_KEYWORDS):
-        return "suspicious"
-    if any(k in s for k in MID_RISK_KEYWORDS):
-        return "warning"
-    return "warning"
+    return frames if len(frames) == frame_count else None
 
 
 def videomae_worker(source="webcam", video_path=None):
     """
-    Background worker for VideoMAE. Reads clips (16 frames) from the source,
-    runs VideoMAE inference, and creates events via `add_event` when suspicious
-    labels are detected.
-
-    The worker stops when `VIDEOMAE_STOP_EVENT` is set. It ensures capture is
-    released on exit so the webcam/video file is freed for other endpoints.
+    Improved VideoMAE worker:
+      - sliding window clips (stride-based)
+      - smoothing over last N clips
+      - sustained vote requirement before emitting event
+      - optional YOLO ROI crop (recommended)
     """
     global VIDEOMAE_RUNNING, VIDEOMAE_STOP_EVENT
 
@@ -384,14 +474,15 @@ def videomae_worker(source="webcam", video_path=None):
         import cv2
         import torch
         import numpy as np
+        from collections import deque
     except ImportError as e:
         add_event("Error", f"VideoMAE worker missing libraries: {e}", status="warning")
         VIDEOMAE_RUNNING = False
         return
 
-    # Load model (lazy)
+    # Load VideoMAE once
     try:
-        model, processor, device = load_videomae_model()
+        model_vm, processor, device = load_videomae_model()
     except Exception as e:
         add_event("Error", f"VideoMAE failed to load: {e}", status="warning")
         VIDEOMAE_RUNNING = False
@@ -401,7 +492,6 @@ def videomae_worker(source="webcam", video_path=None):
     cap = None
     try:
         if source == "webcam":
-            # Prefer DirectShow on Windows for better release behavior
             try:
                 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
             except Exception:
@@ -431,84 +521,142 @@ def videomae_worker(source="webcam", video_path=None):
         VIDEOMAE_RUNNING = False
         return
 
-    # Detection parameters
-    CONF_THRESHOLD = 0.70  # only emit when >= 70%
-    DEDUP_SEC = 10         # per-label cooldown
-    ANY_COOLDOWN = 2       # overall cooldown between any two events
-    CLIP_INTERVAL_SEC = 2  # classify roughly every 2 seconds
+    # ======= TUNING PARAMS (edit these) =======
+    FRAME_COUNT = 16
+    STRIDE = 2                 # overlap control (try 1 if low FPS)
+    CLIP_INTERVAL_SEC = 0.7    # how often we start a new clip
+    SMOOTH_N = 6               # smoothing window size
+    MIN_VOTES = 4              # sustained consistency requirement
+    CONF_THRESHOLD = 0.60      # threshold on smoothed probability
+    DEDUP_SEC = 6
+    ANY_COOLDOWN = 1
+    USE_YOLO_ROI = True
+    ROI_REFRESH_SEC = 1.0
+    # ==========================================
 
-    last_clip_time = 0
-    last_label_emit = {}  # label -> timestamp
-    last_any_emit = 0
+    last_clip_time = 0.0
+    last_any_emit = 0.0
+    last_label_emit = {}
+
+    probs_hist = deque(maxlen=SMOOTH_N)
+    label_hist = deque(maxlen=SMOOTH_N)
+
+    last_roi_time = 0.0
+    current_roi = None
+    clip_idx = 0
+
+    def _inference_ctx():
+        # compatibility fallback for older torch
+        if hasattr(torch, "inference_mode"):
+            return torch.inference_mode()
+        return torch.no_grad()
 
     try:
         while not VIDEOMAE_STOP_EVENT.is_set():
             now = time.time()
 
-            if now - last_clip_time >= CLIP_INTERVAL_SEC:
-                frames = get_videomae_clip(cap, frame_count=16)
-                last_clip_time = now
+            if now - last_clip_time < CLIP_INTERVAL_SEC:
+                time.sleep(0.05)
+                continue
+            last_clip_time = now
 
-                if frames is None:
-                    # No frames available. For video source, end; for webcam, continue.
-                    if source == "video":
-                        break
-                    else:
-                        time.sleep(0.2)
-                        continue
+            # Update ROI occasionally
+            if USE_YOLO_ROI and (now - last_roi_time >= ROI_REFRESH_SEC):
+                ok, roi_frame = cap.read()
+                if ok:
+                    current_roi = _union_person_bbox_yolo(roi_frame)
+                last_roi_time = now
 
-                # inference
-                try:
-                    inputs = processor(list(frames), return_tensors="pt")
+            frames = get_videomae_clip(
+                cap,
+                frame_count=FRAME_COUNT,
+                stride=STRIDE,
+                roi_bbox=current_roi if USE_YOLO_ROI else None
+            )
 
-                    # move tensors to device if available
-                    for k in list(inputs.keys()):
-                        v = inputs[k]
-                        if hasattr(v, "to"):
-                            inputs[k] = v.to(device)
+            if frames is None:
+                if source == "video":
+                    break
+                time.sleep(0.15)
+                continue
 
-                    with torch.no_grad():
-                        outputs = model(**inputs)
+            clip_idx += 1
 
-                    logits = outputs.logits
-                    probs = torch.softmax(logits, dim=-1)
-                    top_prob, top_idx = torch.max(probs, dim=-1)
-                    top_prob = float(top_prob[0])
-                    top_idx = int(top_idx[0])
+            try:
+                inputs = processor(list(frames), return_tensors="pt")
+                for k in list(inputs.keys()):
+                    v = inputs[k]
+                    if hasattr(v, "to"):
+                        inputs[k] = v.to(device)
 
-                    label = model.config.id2label.get(top_idx, str(top_idx))
+                with _inference_ctx():
+                    outputs = model_vm(**inputs)
 
-                    # Skip Normal or low confidence
-                    if label.lower() == "normal" or top_prob < CONF_THRESHOLD:
-                        # no event
-                        pass
-                    else:
-                        # dedup checks
-                        if now - last_any_emit < ANY_COOLDOWN:
-                            # overall cooldown
-                            pass
-                        else:
-                            last_label_time = last_label_emit.get(label, 0)
-                            if now - last_label_time >= DEDUP_SEC:
-                                # map status
-                                status = videomae_label_to_status(label)
-                                location = "Webcam" if source == "webcam" else "Uploaded Video"
-                                add_event(
-                                    event_type=label,
-                                    description=f"VideoMAE: {label} detected with {top_prob:.2%} confidence",
-                                    location=location,
-                                    status=status,
-                                    confidence=int(top_prob * 100),
-                                )
-                                last_label_emit[label] = now
-                                last_any_emit = now
+                logits = outputs.logits
+                probs = torch.softmax(logits, dim=-1)[0].detach().float().cpu().numpy()
 
-                except Exception as e:
-                    # keep worker alive on inference errors
-                    print(f"VideoMAE inference error: {e}")
+                top_idx = int(np.argmax(probs))
+                top_prob = float(probs[top_idx])
+                top_label = model_vm.config.id2label.get(top_idx, str(top_idx))
 
-            # short sleep to be responsive to stop event
-            time.sleep(0.1)
+                label_hist.append(top_label)
+                probs_hist.append(probs)
+
+                if len(probs_hist) < 3:
+                    continue
+
+                avg_probs = np.mean(np.stack(list(probs_hist), axis=0), axis=0)
+                s_idx = int(np.argmax(avg_probs))
+                s_prob = float(avg_probs[s_idx])
+                s_label = model_vm.config.id2label.get(s_idx, str(s_idx))
+
+                votes = sum(1 for l in label_hist if l == s_label)
+
+                print(
+                    f"[VideoMAE {clip_idx}] raw={top_label}({top_prob:.2%}) "
+                    f"smoothed={s_label}({s_prob:.2%}) votes={votes}/{len(label_hist)} "
+                    f"roi={'on' if (USE_YOLO_ROI and current_roi) else 'off'}"
+                )
+
+                # ignore normal outputs
+                if "normal" in (s_label or "").lower():
+                    continue
+
+                # gating
+                if s_prob < CONF_THRESHOLD:
+                    continue
+                if votes < MIN_VOTES:
+                    continue
+
+                # cooldown
+                if now - last_any_emit < ANY_COOLDOWN:
+                    continue
+
+                last_t = last_label_emit.get(s_label, 0.0)
+                if now - last_t < DEDUP_SEC:
+                    continue
+
+                status = videomae_label_to_status(s_label)
+                location = "Webcam" if source == "webcam" else "Uploaded Video"
+
+                add_event(
+                    event_type=s_label,
+                    description=f"VideoMAE(smoothed): {s_label} detected with {s_prob:.2%} (votes {votes}/{len(label_hist)})",
+                    location=location,
+                    status=status,
+                    confidence=int(s_prob * 100),
+                )
+
+                last_label_emit[s_label] = now
+                last_any_emit = now
+
+            except Exception as e:
+                print(f"VideoMAE inference error: {e}")
+                import traceback
+                traceback.print_exc()
+                add_event("Warning", f"VideoMAE inference failed: {str(e)}", status="warning")
+
+            time.sleep(0.05)
 
     except Exception as e:
         print(f"VideoMAE worker exception: {e}")
@@ -518,7 +666,6 @@ def videomae_worker(source="webcam", video_path=None):
                 cap.release()
         except Exception:
             pass
-        # Ensure stop flags are consistent
         VIDEOMAE_STOP_EVENT.clear()
         VIDEOMAE_RUNNING = False
 
@@ -616,7 +763,7 @@ def missing_person_worker(source="webcam", video_path=None):
     DISTANCE_THRESHOLD = 110  # face match threshold
     DEDUP_SEC = 300  # per-person cooldown (5 minutes)
     FRAME_SKIP = 5  # process every 5th frame for speed
-    
+
     last_person_emit = {}  # person_name -> timestamp
     frame_counter = 0
 
@@ -632,7 +779,7 @@ def missing_person_worker(source="webcam", video_path=None):
 
             frame_counter += 1
             if frame_counter % FRAME_SKIP != 0:
-                continue  # skip frames for performance
+                continue
 
             try:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -652,7 +799,6 @@ def missing_person_worker(source="webcam", video_path=None):
                             person_age = person_meta.get("age", "N/A")
                             confidence = int(100 - distance)
 
-                            # Dedup: don't spam alerts for same person
                             now = time.time()
                             last_emit_time = last_person_emit.get(person_name, 0)
                             if now - last_emit_time >= DEDUP_SEC:
@@ -668,7 +814,6 @@ def missing_person_worker(source="webcam", video_path=None):
                 print(f"Missing person detection error: {e}")
                 continue
 
-            # short sleep to be responsive to stop event
             time.sleep(0.01)
 
     except Exception as e:
@@ -684,8 +829,13 @@ def missing_person_worker(source="webcam", video_path=None):
 
 
 # ========================================
-# Existing Endpoints (unchanged)
+# Endpoints
 # ========================================
+
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    return jsonify({"status": "ok"})
+
 
 @app.route("/test-detection")
 def test_detection():
@@ -884,7 +1034,6 @@ def suspicious_detect():
         cap.release()
         return jsonify({"error": "Failed to load suspicious model", "detail": str(e)}), 500
 
-    # ✅ NORMAL SETTINGS (avoid spam)
     CONF_TH = 0.60
     COOLDOWN_SEC = 30
 
@@ -996,7 +1145,11 @@ def videomae_start():
         VIDEOMAE_SOURCE = source
         VIDEOMAE_STOP_EVENT.clear()
         VIDEOMAE_RUNNING = True
-        VIDEOMAE_THREAD = threading.Thread(target=videomae_worker, args=(VIDEOMAE_SOURCE, VIDEOMAE_VIDEO_PATH), daemon=True)
+        VIDEOMAE_THREAD = threading.Thread(
+            target=videomae_worker,
+            args=(VIDEOMAE_SOURCE, VIDEOMAE_VIDEO_PATH),
+            daemon=True
+        )
         VIDEOMAE_THREAD.start()
 
         return jsonify({"running": True, "source": VIDEOMAE_SOURCE, "video_path": VIDEOMAE_VIDEO_PATH})
@@ -1011,11 +1164,9 @@ def videomae_stop():
         if not VIDEOMAE_RUNNING:
             return jsonify({"running": False, "message": "VideoMAE already stopped"})
 
-        # signal worker to stop
         VIDEOMAE_STOP_EVENT.set()
         VIDEOMAE_RUNNING = False
 
-        # Attempt to join the worker (short timeout to avoid hanging)
         if VIDEOMAE_THREAD and VIDEOMAE_THREAD.is_alive():
             try:
                 VIDEOMAE_THREAD.join(timeout=3)
@@ -1066,7 +1217,6 @@ def stream_suspicious():
     except Exception as e:
         return jsonify({"error": "Required CV libraries not installed", "detail": str(e)}), 500
 
-    # open capture
     cap = None
     try:
         if source == "video":
@@ -1077,7 +1227,6 @@ def stream_suspicious():
                 return jsonify({"error": "video file not found", "path": abs_path}), 404
             cap = cv2.VideoCapture(abs_path)
         else:
-            # webcam
             try:
                 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
             except Exception:
@@ -1138,10 +1287,8 @@ def missing_register():
     if not images or len(images) == 0:
         return jsonify({"error": "at least one image is required"}), 400
 
-    # Ensure directories
     mp_ensure_dirs()
 
-    # Create safe folder name
     safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name.lower())
     person_dir = os.path.join(mp_paths()["dataset"], safe_name)
     os.makedirs(person_dir, exist_ok=True)
@@ -1159,7 +1306,6 @@ def missing_register():
             if img is None:
                 continue
 
-            # Save with unique name
             filename = f"{safe_name}_{uuid.uuid4().hex[:8]}.jpg"
             filepath = os.path.join(person_dir, filename)
             cv2.imwrite(filepath, img)
@@ -1170,7 +1316,6 @@ def missing_register():
     if images_saved == 0:
         return jsonify({"error": "Failed to save any images"}), 400
 
-    # Update persons.json
     persons = load_persons_json()
     persons[safe_name] = {"name": name, "age": age}
     save_persons_json(persons)
@@ -1195,13 +1340,11 @@ def missing_train():
 
     mp_ensure_dirs()
 
-    # Load cascade
     try:
         cascade = load_face_cascade()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Collect images and labels
     faces_list = []
     labels_list = []
     label_mapping = {}
@@ -1246,12 +1389,10 @@ def missing_train():
             "error": "No faces found in dataset. Ensure images contain clear frontal faces."
         }), 400
 
-    # Train LBPH recognizer
     try:
         recognizer = cv2.face.LBPHFaceRecognizer_create()
         recognizer.train(np.array(faces_list), np.array(labels_list))
 
-        # Save model
         trainer_dir = mp_paths()["trainer"]
         model_path = os.path.join(trainer_dir, "face_trainer.yml")
         labels_path = os.path.join(trainer_dir, "labels.npy")
@@ -1259,7 +1400,6 @@ def missing_train():
         recognizer.write(model_path)
         np.save(labels_path, label_mapping)
 
-        # Invalidate cache so next detect loads new model
         invalidate_lbph_cache()
 
         return jsonify({
@@ -1294,7 +1434,6 @@ def missing_detect_image():
     if frame is None:
         return jsonify({"error": "Invalid image"}), 400
 
-    # Load models
     try:
         cascade = load_face_cascade()
     except Exception as e:
@@ -1309,10 +1448,8 @@ def missing_detect_image():
         }), 400
 
     persons = load_persons_json()
-
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Better detection settings
     faces = cascade.detectMultiScale(
         gray,
         scaleFactor=1.2,
@@ -1320,21 +1457,19 @@ def missing_detect_image():
         minSize=(80, 80)
     )
 
-    DISTANCE_THRESHOLD = 100   # face match threshold
+    DISTANCE_THRESHOLD = 100
 
-    detections = []  # List of all detected faces
+    detections = []
     best_match = None
     best_distance = 999
 
-    # Analyze each detected face
     for (x, y, w, h) in faces:
         face_roi = gray[y:y+h, x:x+w]
         face_roi = cv2.resize(face_roi, (200, 200))
 
         label, distance = recognizer.predict(face_roi)
-
         is_match = distance < DISTANCE_THRESHOLD
-        
+
         if is_match:
             key = label_mapping.get(label, "unknown")
             meta = persons.get(key, {})
@@ -1352,19 +1487,16 @@ def missing_detect_image():
             }
             detections.append(detection_info)
 
-            # Track best match
             if distance < best_distance:
                 best_distance = distance
                 best_match = detection_info
         else:
-            # Face detected but no match (normal face)
             detections.append({
                 "found": False,
                 "confidence": int(max(0, 100 - distance)),
                 "bbox": [int(x), int(y), int(w), int(h)]
             })
 
-    # If we have matches, create alert for best match only
     if best_match:
         add_missing_person_alert(
             name=best_match["name"],
@@ -1373,12 +1505,12 @@ def missing_detect_image():
             person_id=best_match["person_id"]
         )
 
-    # Return all detections (frontend will show current matches)
     return jsonify({
         "found": len([d for d in detections if d.get("found")]) > 0,
         "detections": detections,
         "best_match": best_match
     })
+
 
 # ========================================
 # Missing Person Detection Endpoints
@@ -1417,8 +1549,8 @@ def missing_start_detection():
         MISSING_PERSON_STOP_EVENT.clear()
         MISSING_PERSON_RUNNING = True
         MISSING_PERSON_THREAD = threading.Thread(
-            target=missing_person_worker, 
-            args=(MISSING_PERSON_SOURCE, MISSING_PERSON_VIDEO_PATH), 
+            target=missing_person_worker,
+            args=(MISSING_PERSON_SOURCE, MISSING_PERSON_VIDEO_PATH),
             daemon=True
         )
         MISSING_PERSON_THREAD.start()
@@ -1488,5 +1620,51 @@ def get_latest_missing_alert():
     return jsonify({"alert": None})
 
 
+@app.route("/api/debug/config", methods=["GET"])
+def debug_config():
+    """Debug endpoint to check configuration and model availability."""
+    debug_info = {
+        "videomae_running": VIDEOMAE_RUNNING,
+        "videomae_source": VIDEOMAE_SOURCE,
+        "missing_person_running": MISSING_PERSON_RUNNING,
+        "suspicious_events_count": len(SUSPICIOUS_EVENTS),
+        "missing_alerts_count": len(MISSING_PERSON_ALERTS),
+        "models_loaded": {
+            "videomae": videomae_model is not None,
+            "suspicious": suspicious_model is not None,
+            "person": model is not None,
+        },
+        "dependencies": {
+            "cv2": True,
+            "numpy": True,
+            "torch": False,
+            "transformers": False,
+        }
+    }
+
+    try:
+        import torch  # noqa: F401
+        debug_info["dependencies"]["torch"] = True
+    except ImportError:
+        pass
+
+    try:
+        from transformers import AutoImageProcessor  # noqa: F401
+        debug_info["dependencies"]["transformers"] = True
+    except ImportError:
+        pass
+
+    return jsonify(debug_info)
+
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    print("Starting Smart Surveillance Backend...")
+    print("Available endpoints:")
+    print("  GET  /api/health - Health check")
+    print("  POST /api/videomae/start - Start VideoMAE detection")
+    print("  POST /api/videomae/stop - Stop VideoMAE detection")
+    print("  GET  /api/videomae/status - Get VideoMAE status")
+    print("  GET  /suspicious/events - Get all detections")
+    print("  GET  /api/debug/config - Debug configuration")
+    print("")
+    app.run(debug=False, host="0.0.0.0", port=5000, use_reloader=False)
